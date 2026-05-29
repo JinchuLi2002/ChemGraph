@@ -22,6 +22,7 @@ Then open `http://localhost:8501`.
 ## Features
 
 - Chat interface for single-agent and multi-agent workflows
+- Live per-query workflow graph with pan/zoom and node input/output inspection
 - Model selection across supported providers
 - 3D molecular visualization with `stmol`/`py3Dmol`
 - Embedded report display and structure export

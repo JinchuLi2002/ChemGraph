@@ -53,6 +53,7 @@ from ui.visualization import (
     display_molecular_structure,
     visualize_trajectory,
 )
+from ui.workflow_graph import render_workflow_graph
 
 # Re-use the constants from the configuration page
 from ui._pages.configuration import normalize_workflow_name
@@ -483,6 +484,9 @@ def _render_single_exchange(idx: int, entry: dict, thread_id: int) -> None:
         if final_answer:
             st.markdown(final_answer)
 
+        # Interactive workflow graph
+        _render_workflow_graph_section(idx, messages, entry)
+
         # Structure visualisation
         html_filename = find_html_filename(messages)
         _render_structure_section(idx, messages, final_answer, entry, html_filename)
@@ -535,6 +539,15 @@ def _extract_final_answer(messages: list) -> str:
                 final_answer = content
                 break
     return final_answer
+
+
+def _render_workflow_graph_section(idx: int, messages: list, entry: dict) -> None:
+    with st.expander(f"Workflow Graph (Query {idx})", expanded=False):
+        render_workflow_graph(
+            entry.get("query", ""),
+            messages,
+            key=f"workflow_graph_{idx}",
+        )
 
 
 def _render_structure_section(
@@ -779,6 +792,7 @@ def _stream_workflow(stream_input, config, agent, msg_queue):
     """Run the agent workflow in a background thread, pushing events to a queue.
 
     Events pushed:
+        ("workflow_messages", messages) — latest graph-visible message snapshot
         ("tool_call", [tool_names])   — agent is calling tool(s)
         ("tool_result", tool_name)    — a tool finished
         ("interrupt", question_str)
@@ -806,6 +820,7 @@ def _stream_workflow(stream_input, config, agent, msg_queue):
                         interrupt_val = {"question": "The workflow needs your input."}
 
                 if "messages" in s and s["messages"] != prev_msgs:
+                    msg_queue.put(("workflow_messages", list(s["messages"])))
                     new_message = s["messages"][-1]
                     classified = _classify_message(new_message)
                     if classified:
@@ -852,7 +867,17 @@ def _stream_workflow(stream_input, config, agent, msg_queue):
         msg_queue.put(("error", exc))
 
 
-def _poll_and_display(msg_queue, status_container, placeholder, thread):
+def _poll_and_display(
+    msg_queue,
+    status_container,
+    placeholder,
+    thread,
+    *,
+    workflow_placeholder=None,
+    workflow_query: str = "",
+    workflow_prev_msg_count: int = 0,
+    workflow_key: str = "workflow_graph_live",
+):
     """Poll the message queue and render a compact tool-call log.
 
     Uses a single ``st.empty()`` placeholder to re-render the full list
@@ -865,6 +890,17 @@ def _poll_and_display(msg_queue, status_container, placeholder, thread):
     completed: list[str] = []  # tools that finished
     active: list[str] = []  # tools currently running
 
+    def _render_workflow(messages: list) -> None:
+        if workflow_placeholder is None:
+            return
+        workflow_placeholder.empty()
+        with workflow_placeholder.container():
+            render_workflow_graph(
+                workflow_query,
+                messages,
+                key=workflow_key,
+            )
+
     def _render():
         lines = []
         for name in completed:
@@ -872,6 +908,8 @@ def _poll_and_display(msg_queue, status_container, placeholder, thread):
         for name in active:
             lines.append(f"- **{name}** :hourglass_flowing_sand:")
         placeholder.markdown("\n".join(lines) if lines else "")
+
+    _render_workflow([])
 
     while True:
         try:
@@ -885,7 +923,10 @@ def _poll_and_display(msg_queue, status_container, placeholder, thread):
             else:
                 continue
 
-        if event_type == "tool_call":
+        if event_type == "workflow_messages":
+            visible_messages = list(event_data)[workflow_prev_msg_count:]
+            _render_workflow(visible_messages)
+        elif event_type == "tool_call":
             # Mark previously active tools as completed
             completed.extend(active)
             active.clear()
@@ -911,6 +952,16 @@ def _poll_and_display(msg_queue, status_container, placeholder, thread):
             completed.extend(active)
             active.clear()
             _render()
+            if (
+                event_type == "done"
+                and workflow_placeholder is not None
+                and isinstance(event_data, dict)
+                and "messages" in event_data
+            ):
+                visible_messages = list(event_data["messages"])[
+                    workflow_prev_msg_count:
+                ]
+                _render_workflow(visible_messages)
             return (event_type, event_data)
 
 
@@ -967,6 +1018,7 @@ def _handle_query_submission(
     with st.chat_message("assistant"):
         msg_q: queue.Queue = queue.Queue()
         inputs = {"messages": trimmed_query}
+        run_idx = len(st.session_state.conversation_history) + 1
 
         stream_thread = threading.Thread(
             target=_stream_workflow,
@@ -974,12 +1026,21 @@ def _handle_query_submission(
             daemon=True,
         )
 
+        with st.expander(f"Workflow Graph (Query {run_idx}, live)", expanded=True):
+            workflow_graph_slot = st.empty()
         status = st.status("Thinking...", expanded=True)
         with status:
             tool_log = st.empty()
         stream_thread.start()
         event_type, event_data = _poll_and_display(
-            msg_q, status, tool_log, stream_thread
+            msg_q,
+            status,
+            tool_log,
+            stream_thread,
+            workflow_placeholder=workflow_graph_slot,
+            workflow_query=trimmed_query,
+            workflow_prev_msg_count=prev_msg_count,
+            workflow_key=f"workflow_graph_live_{thread_id}_{run_idx}",
         )
         stream_thread.join(timeout=5)
 
@@ -1057,6 +1118,8 @@ def _handle_human_response(answer: str, thread_id: int) -> None:
     with st.chat_message("assistant"):
         msg_q: queue.Queue = queue.Queue()
         resume_cmd = Command(resume=answer)
+        run_idx = len(st.session_state.conversation_history) + 1
+        prev_msg_count = st.session_state.get("pending_interrupt_prev_msg_count", 0)
 
         stream_thread = threading.Thread(
             target=_stream_workflow,
@@ -1064,12 +1127,21 @@ def _handle_human_response(answer: str, thread_id: int) -> None:
             daemon=True,
         )
 
+        with st.expander(f"Workflow Graph (Query {run_idx}, live)", expanded=True):
+            workflow_graph_slot = st.empty()
         status = st.status("Processing your response...", expanded=True)
         with status:
             tool_log = st.empty()
         stream_thread.start()
         event_type, event_data = _poll_and_display(
-            msg_q, status, tool_log, stream_thread
+            msg_q,
+            status,
+            tool_log,
+            stream_thread,
+            workflow_placeholder=workflow_graph_slot,
+            workflow_query=original_query or answer,
+            workflow_prev_msg_count=prev_msg_count,
+            workflow_key=f"workflow_graph_live_resume_{thread_id}_{run_idx}",
         )
         stream_thread.join(timeout=5)
 
@@ -1083,9 +1155,6 @@ def _handle_human_response(answer: str, thread_id: int) -> None:
                 return
 
             # Only keep messages from this query (not prior thread history)
-            prev_msg_count = st.session_state.get(
-                "pending_interrupt_prev_msg_count", 0
-            )
             all_msgs = result_state.get("messages", [])
             new_msgs = all_msgs[prev_msg_count:]
             final_result = {"messages": new_msgs}
@@ -1123,6 +1192,3 @@ def _handle_human_response(answer: str, thread_id: int) -> None:
             st.session_state.last_run_error = event_data
             st.error(f"Error during resume: {event_data}")
             _clear_interrupt_state()
-
-
-
